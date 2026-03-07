@@ -45,7 +45,7 @@ from app.utils.image_utils import (
 )
 
 # Reuse model resolution and content extraction from chat.py
-from app.endpoints.chat import _resolve_model, _extract_multimodal_content, _get_cookies
+from app.endpoints.chat import _resolve_model, _extract_multimodal_content, _get_cookies, _build_json_system_prompt, _extract_json
 
 router = APIRouter()
 
@@ -249,6 +249,20 @@ async def create_response(request: dict):
     final_prompt = "\n\n".join(conversation_parts)
     files_arg = all_file_paths if all_file_paths else None
 
+    # Structured output support
+    json_mode = False
+    json_schema_dict = None
+    raw_text = request.get("text", {})
+    rf = request.get("response_format") or (raw_text.get("format") if isinstance(raw_text, dict) else None)
+    if isinstance(rf, dict) and rf.get("type") in ("json_object", "json_schema"):
+        from schemas.request import ResponseFormat
+        json_mode = True
+        fmt = ResponseFormat(**rf)
+        json_instruction = _build_json_system_prompt(fmt)
+        final_prompt = f"System: {json_instruction}\n\n{final_prompt}"
+        if fmt.type == "json_schema" and fmt.json_schema and fmt.json_schema.schema_:
+            json_schema_dict = fmt.json_schema.schema_
+
     try:
         response = await gemini_client.generate_content(
             message=final_prompt,
@@ -256,13 +270,17 @@ async def create_response(request: dict):
             files=files_arg,
         )
 
+        response_text = response.text
+        if json_mode:
+            response_text = _extract_json(response_text, schema=json_schema_dict)
+
         images = await serialize_response_images(
             response, gemini_cookies=_get_cookies(gemini_client)
         )
 
         if is_stream:
             return StreamingResponse(
-                _stream_responses_api(response.text, model_value, images),
+                _stream_responses_api(response_text, model_value, images),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -270,7 +288,7 @@ async def create_response(request: dict):
         # Non-streaming response
         resp_id = _make_response_id()
         msg_id = _make_message_id()
-        content_text = response.text
+        content_text = response_text
         if images:
             md_links = "\n".join(f"![{img['title']}]({img['url']})" for img in images)
             content_text = f"{content_text}\n\n{md_links}".strip()

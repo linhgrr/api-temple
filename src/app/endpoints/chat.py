@@ -1,8 +1,12 @@
 # src/app/endpoints/chat.py
 import json
+import re
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+import json_repair
+import jsonschema
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -19,9 +23,73 @@ from app.utils.image_utils import (
     get_temp_dir,
     serialize_response_images,
 )
-from schemas.request import GeminiModels, GeminiRequest, OpenAIChatRequest
+from schemas.request import GeminiModels, GeminiRequest, OpenAIChatRequest, ResponseFormat
 
 router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# Structured output helpers
+# ---------------------------------------------------------------------------
+
+def _build_json_system_prompt(response_format: ResponseFormat) -> str:
+    """Build a system instruction that forces the model to return valid JSON."""
+    if response_format.type == "json_object":
+        return (
+            "You MUST respond with valid JSON only. "
+            "Do not include any text, explanation, or markdown formatting outside the JSON. "
+            "Do not wrap the JSON in ```json``` code blocks. "
+            "Output raw JSON directly."
+        )
+
+    if response_format.type == "json_schema" and response_format.json_schema:
+        schema = response_format.json_schema
+        schema_json = json.dumps(schema.schema_ or {}, ensure_ascii=False)
+        desc = f" Description: {schema.description}" if schema.description else ""
+        return (
+            f"You MUST respond with valid JSON that conforms to the following JSON schema.{desc}\n"
+            f"JSON Schema:\n{schema_json}\n\n"
+            "Do not include any text, explanation, or markdown formatting outside the JSON. "
+            "Do not wrap the JSON in ```json``` code blocks. "
+            "Output raw JSON directly."
+        )
+
+    return ""
+
+
+def _extract_json(text: str, schema: Optional[dict] = None) -> str:
+    """Extract and repair JSON from LLM output using json-repair.
+
+    Steps:
+    1. Strip markdown code fences if present
+    2. Use json_repair to fix common LLM JSON mistakes
+       (trailing commas, single quotes, missing quotes, etc.)
+    3. Validate against JSON Schema if provided
+
+    Returns the cleaned JSON string. Raises ValueError on validation failure.
+    """
+    # Strip markdown code fences (```json ... ``` or ``` ... ```)
+    m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+    if m:
+        text = m.group(1).strip()
+
+    # Use json_repair to parse and fix broken JSON
+    repaired = json_repair.repair_json(text, return_objects=True)
+
+    # json_repair returns the parsed object; serialize back to clean JSON string
+    if isinstance(repaired, (dict, list)):
+        # Validate against schema if provided
+        if schema:
+            try:
+                jsonschema.validate(instance=repaired, schema=schema)
+            except jsonschema.ValidationError as e:
+                logger.warning(f"Structured output schema validation failed: {e.message}")
+                # Still return the JSON — validation is best-effort since LLM output
+                # can't be perfectly constrained
+        return json.dumps(repaired, ensure_ascii=False)
+
+    # If repair returned a scalar or string, return as-is
+    return json.dumps(repaired, ensure_ascii=False) if repaired is not None else text
 
 
 # ---------------------------------------------------------------------------
@@ -161,15 +229,25 @@ async def _extract_multimodal_content(content) -> Tuple[str, List[Path]]:
                     logger.warning(f"Skipping invalid base64 image: {exc}")
 
             elif url.startswith("file://"):
-                # Reference to a previously uploaded file — resolve file_id
-                file_id = url[len("file://"):]
-                # Sanitize
-                if "/" not in file_id and "\\" not in file_id and ".." not in file_id:
-                    candidate = get_temp_dir() / file_id
+                # Reference to a local file. Supports:
+                #   1. file://<file_id>         → look up inside temp dir
+                #   2. file:///absolute/path    → any local file path
+                raw_path = url[len("file://"):]
+
+                if raw_path.startswith("/"):
+                    # Absolute path — resolve and check existence
+                    candidate = Path(raw_path).resolve()
+                    if candidate.exists() and candidate.is_file():
+                        file_paths.append(candidate)
+                    else:
+                        logger.warning(f"Local file not found: {candidate}")
+                elif "/" not in raw_path and "\\" not in raw_path and ".." not in raw_path:
+                    # Plain file_id from /v1/files upload
+                    candidate = get_temp_dir() / raw_path
                     if candidate.exists():
                         file_paths.append(candidate)
                     else:
-                        logger.warning(f"File not found for file_id: {file_id}")
+                        logger.warning(f"File not found for file_id: {raw_path}")
                 else:
                     logger.warning(f"Invalid file_id in URL: {url}")
 
@@ -313,15 +391,51 @@ async def _stream_response(response_text: str, model: str, images: list):
 @router.post("/v1/chat/completions")
 async def chat_completions(request: OpenAIChatRequest):
     """
-    OpenAI-compatible chat completion endpoint with multimodal support.
+    OpenAI-compatible chat completion endpoint.
 
-    Supports:
-    - Plain text messages
-    - ``image_url`` content parts with base64 data URIs (``data:image/...;base64,...``)
-    - ``image_url`` content parts with remote HTTPS URLs (downloaded automatically)
-    - ``image_url`` content parts with ``file://`` references to uploaded file IDs
+    **Features:**
+    - Plain text and multimodal messages (images, PDFs)
+    - ``image_url`` content parts: base64 data URIs, HTTPS URLs, or ``file://`` references
+    - Streaming via SSE (``stream: true``)
+    - Structured output via ``response_format``
     - ``thoughts`` field in response (thinking models)
     - ``images`` field in response (web/generated images)
+
+    **Structured Output Examples:**
+
+    *JSON Object mode* — returns valid JSON (free-form):
+    ```json
+    {
+      "model": "gemini-3.0-pro",
+      "messages": [{"role": "user", "content": "List 3 colors as JSON"}],
+      "response_format": {"type": "json_object"}
+    }
+    ```
+
+    *JSON Schema mode* — returns JSON conforming to a schema:
+    ```json
+    {
+      "model": "gemini-3.0-pro",
+      "messages": [{"role": "user", "content": "Info about Python"}],
+      "response_format": {
+        "type": "json_schema",
+        "json_schema": {
+          "name": "language_info",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "name": {"type": "string"},
+              "year": {"type": "integer"}
+            },
+            "required": ["name", "year"]
+          }
+        }
+      }
+    }
+    ```
+
+    Broken JSON from the model is auto-repaired (trailing commas, single quotes, etc.).
+    Schema validation is best-effort — the response is always returned.
     """
     try:
         gemini_client = get_gemini_client()
@@ -371,6 +485,18 @@ async def chat_completions(request: OpenAIChatRequest):
     final_prompt = "\n\n".join(conversation_parts)
     files_arg = all_file_paths if all_file_paths else None
 
+    # Structured output: inject JSON instructions into the prompt
+    json_mode = False
+    json_schema_dict = None
+    if request.response_format and request.response_format.type in ("json_object", "json_schema"):
+        json_mode = True
+        json_instruction = _build_json_system_prompt(request.response_format)
+        final_prompt = f"System: {json_instruction}\n\n{final_prompt}"
+        if (request.response_format.type == "json_schema"
+                and request.response_format.json_schema
+                and request.response_format.json_schema.schema_):
+            json_schema_dict = request.response_format.json_schema.schema_
+
     try:
         response = await gemini_client.generate_content(
             message=final_prompt,
@@ -378,17 +504,21 @@ async def chat_completions(request: OpenAIChatRequest):
             files=files_arg,
         )
 
+        response_text = response.text
+        if json_mode:
+            response_text = _extract_json(response_text, schema=json_schema_dict)
+
         images = await serialize_response_images(
             response, gemini_cookies=_get_cookies(gemini_client)
         )
 
         if is_stream:
             return StreamingResponse(
-                _stream_response(response.text, model_value, images),
+                _stream_response(response_text, model_value, images),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
-        return _to_openai_format(response.text, model_value, images, is_stream)
+        return _to_openai_format(response_text, model_value, images, is_stream)
 
     except Exception as e:
         err_str = str(e)

@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: api-temple
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHONPATH
+        value: /app/src
+      - key: CONFIG_PATH
+        value: /app/data/config.conf
+      - key: COOKIES_PASSWORD
+        sync: false

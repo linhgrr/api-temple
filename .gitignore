@@ -9,3 +9,6 @@ generated_media
 har_and_cookies
 # Playwright MCP
 .playwright-mcp/
+
+# Environment variables
+.env

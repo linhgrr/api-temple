@@ -8,6 +8,10 @@ import sys
 import threading
 import os
 import signal
+
+from dotenv import load_dotenv
+load_dotenv()
+
 from typing import Dict, Union, Tuple
 from fastapi.routing import APIRoute
 from typing import TYPE_CHECKING

@@ -12,8 +12,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy project files
 COPY . .
 
-# Default Port 
+# Set PYTHONPATH so uvicorn can find the app module inside src/
+ENV PYTHONPATH=/app/src
+
+# Default Port (Render overrides via $PORT)
 EXPOSE 6969
 
-# Run Uvicorn server
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "6969"]
+# Run Uvicorn server — use shell form so $PORT is expanded at runtime
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-6969}

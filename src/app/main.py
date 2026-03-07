@@ -17,6 +17,7 @@ from app.logger import logger
 # Import endpoint routers
 from app.endpoints import gemini, chat, google_generative, files, responses
 from app.endpoints import admin, admin_api
+from app.endpoints import cookies
 
 _SRC_DIR = Path(__file__).resolve().parent.parent  # points to src/
 
@@ -73,6 +74,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+
+@app.get("/health", tags=["System"])
+async def health_check():
+    """Health check endpoint for Render / load balancers."""
+    return {"status": "ok"}
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -87,6 +95,7 @@ app.include_router(chat.router)
 app.include_router(google_generative.router)
 app.include_router(files.router)
 app.include_router(responses.router)
+app.include_router(cookies.router)
 
 # Register admin routers
 app.include_router(admin.router)
