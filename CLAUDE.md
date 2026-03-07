@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 WebAI-to-API is a modular FastAPI web server that exposes browser-based LLMs (primarily Google Gemini) as local API endpoints. The project supports two operational modes:
 
+pl
+
 1. **WebAI-to-API Server** (Primary): FastAPI-based server connecting to Gemini web interface using browser cookies
 2. **gpt4free Server** (Fallback): Secondary server powered by the g4f library for broader LLM access
 
