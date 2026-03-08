@@ -6,7 +6,8 @@
   "permissions": [
     "cookies",
     "storage",
-    "alarms"
+    "alarms",
+    "notifications"
   ],
   "host_permissions": [
     "https://gemini.google.com/*"

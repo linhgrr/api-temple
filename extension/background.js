@@ -6,7 +6,26 @@ const DEFAULT_CONFIG = {
 };
 
 const GEMINI_URL = "https://gemini.google.com";
-const COOKIE_DOMAIN = ".google.com";
+
+// --- Notifications ---
+
+function notifySignedOut() {
+  chrome.notifications.create("gemini-signout", {
+    type: "basic",
+    iconUrl: "icon.png",
+    title: "Gemini Sign-In Required",
+    message: "You have been signed out of Gemini. Click to sign in again.",
+    priority: 2,
+    requireInteraction: true,
+  });
+}
+
+chrome.notifications.onClicked.addListener((id) => {
+  if (id === "gemini-signout") {
+    chrome.tabs.create({ url: GEMINI_URL, active: true });
+    chrome.notifications.clear(id);
+  }
+});
 
 // --- Cookie extraction ---
 
@@ -22,16 +41,42 @@ async function getGeminiCookies() {
   return cookies;
 }
 
+// --- Refresh cookies by visiting Gemini ---
+
+async function refreshGeminiPage() {
+  // Find existing Gemini tab or create one
+  const tabs = await chrome.tabs.query({ url: "https://gemini.google.com/*" });
+  if (tabs.length > 0) {
+    // Reload existing tab to trigger cookie refresh
+    await chrome.tabs.reload(tabs[0].id);
+  } else {
+    // Open in background
+    await chrome.tabs.create({ url: GEMINI_URL, active: false });
+  }
+}
+
 // --- API push ---
 
-async function pushCookies() {
+async function pushCookies(forceReinit = false) {
   const config = await chrome.storage.local.get(DEFAULT_CONFIG);
   const cookies = await getGeminiCookies();
 
   if (!cookies["__Secure-1PSID"] || !cookies["__Secure-1PSIDTS"]) {
-    console.log("[GeminiSync] Cookies not found, skipping push.");
+    console.log("[GeminiSync] Cookies not found — user likely signed out.");
     await setBadge("!", "#F44336");
-    return { ok: false, error: "Cookies not found in browser" };
+    notifySignedOut();
+    return { ok: false, error: "Signed out — please sign in to Gemini" };
+  }
+
+  // Check if cookies actually changed since last successful sync
+  const prev = await chrome.storage.local.get(["lastPushedPSID", "lastPushedPSIDTS"]);
+  const psidChanged = cookies["__Secure-1PSID"] !== prev.lastPushedPSID;
+  const psidtsChanged = cookies["__Secure-1PSIDTS"] !== prev.lastPushedPSIDTS;
+
+  if (!psidChanged && !psidtsChanged && !forceReinit) {
+    console.log("[GeminiSync] Cookies unchanged, skipping push.");
+    await setBadge("✓", "#4CAF50");
+    return { ok: true, skipped: true };
   }
 
   try {
@@ -54,7 +99,12 @@ async function pushCookies() {
     if (resp.ok && data.gemini_connected) {
       console.log("[GeminiSync] Cookies synced successfully.");
       await setBadge("✓", "#4CAF50");
-      await chrome.storage.local.set({ lastSync: Date.now(), lastError: null });
+      await chrome.storage.local.set({
+        lastSync: Date.now(),
+        lastError: null,
+        lastPushedPSID: cookies["__Secure-1PSID"],
+        lastPushedPSIDTS: cookies["__Secure-1PSIDTS"],
+      });
       return { ok: true, data };
     } else {
       const err = data.message || data.detail || resp.statusText;
@@ -71,6 +121,29 @@ async function pushCookies() {
   }
 }
 
+// --- Smart sync: refresh Gemini page first, wait, then push ---
+
+async function smartSync(forceReinit = false) {
+  // Refresh the Gemini page to get fresh cookies from Google
+  await refreshGeminiPage();
+  // Wait for page to load and cookies to update
+  return new Promise((resolve) => {
+    setTimeout(async () => {
+      const result = await pushCookies(forceReinit);
+      // If failed due to expired cookies, try once more after another refresh
+      if (!result.ok && result.error && result.error.includes("expired")) {
+        console.log("[GeminiSync] Cookies expired, retrying after refresh...");
+        await refreshGeminiPage();
+        setTimeout(async () => {
+          resolve(await pushCookies(forceReinit));
+        }, 8000);
+      } else {
+        resolve(result);
+      }
+    }, 5000);
+  });
+}
+
 // --- Badge helper ---
 
 async function setBadge(text, color) {
@@ -78,11 +151,33 @@ async function setBadge(text, color) {
   await chrome.action.setBadgeBackgroundColor({ color });
 }
 
-// --- Alarms (periodic sync) ---
+// --- Cookie change listener (real-time rotation detection) ---
+
+chrome.cookies.onChanged.addListener((changeInfo) => {
+  const { cookie, removed } = changeInfo;
+  if (cookie.domain !== ".google.com") return;
+  if (cookie.name !== "__Secure-1PSIDTS" && cookie.name !== "__Secure-1PSID") return;
+
+  if (removed) {
+    // Cookie was deleted — user signed out
+    console.log(`[GeminiSync] Cookie ${cookie.name} removed — signed out.`);
+    notifySignedOut();
+    setBadge("!", "#F44336");
+    return;
+  }
+
+  console.log(`[GeminiSync] Cookie ${cookie.name} changed, scheduling push...`);
+  // Debounce: wait 3s in case multiple cookies change at once
+  clearTimeout(pushCookies._debounceTimer);
+  pushCookies._debounceTimer = setTimeout(() => pushCookies(true), 3000);
+});
+pushCookies._debounceTimer = null;
+
+// --- Alarms (periodic sync as fallback) ---
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === "sync-cookies") {
-    await pushCookies();
+    await smartSync();
   }
 });
 
@@ -94,15 +189,11 @@ async function setupAlarm() {
   });
 }
 
-// --- Startup: open Gemini tab (background) + first sync ---
+// --- Startup: open Gemini tab + first sync ---
 
 chrome.runtime.onStartup.addListener(async () => {
-  // Open Gemini in background so cookies get refreshed
-  chrome.tabs.create({ url: GEMINI_URL, active: false });
-
-  // Wait a few seconds for cookies to settle, then sync
-  setTimeout(() => pushCookies(), 5000);
   await setupAlarm();
+  await smartSync(true);
 });
 
 // Extension installed / updated
@@ -116,7 +207,7 @@ chrome.runtime.onInstalled.addListener(async () => {
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.action === "sync-now") {
-    pushCookies().then(sendResponse);
+    smartSync(true).then(sendResponse);
     return true; // keep channel open for async response
   }
   if (msg.action === "get-status") {

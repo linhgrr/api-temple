@@ -17,7 +17,7 @@ from app.logger import logger
 # Import endpoint routers
 from app.endpoints import gemini, chat, google_generative, files, responses
 from app.endpoints import admin, admin_api
-from app.endpoints import cookies
+from app.endpoints import cookies, browser_login
 
 _SRC_DIR = Path(__file__).resolve().parent.parent  # points to src/
 
@@ -100,6 +100,7 @@ app.include_router(cookies.router)
 # Register admin routers
 app.include_router(admin.router)
 app.include_router(admin_api.router)
+app.include_router(browser_login.router)
 
 # Mount static files for admin UI
 app.mount("/static", StaticFiles(directory=str(_SRC_DIR / "static")), name="static")
