@@ -4,7 +4,6 @@ import logging
 import base64
 from typing import Optional, Tuple
 import nodriver as uc
-from xvfbwrapper import Xvfb
 
 logger = logging.getLogger(__name__)
 
@@ -21,21 +20,12 @@ class RemoteBrowserManager:
         
         logger.info("Starting remote browser session via nodriver...")
         
-        # Step 1: Try to start Xvfb virtual display (needed for "headful" mode in Docker)
-        try:
-            self.vdisplay = Xvfb(width=1024, height=768, colordepth=24)
-            self.vdisplay.start()
-            logger.info("Xvfb virtual display started.")
-        except OSError as e:
-            logger.warning(f"Xvfb not found, running without virtual display: {e}")
-            self.vdisplay = None
-        
-        # Step 2: Start Chromium via nodriver (runs regardless of Xvfb success/failure)
+        # Start Chromium via nodriver in new headless mode (works without X11/Xvfb in Docker)
         try:
             logger.info("Initializing nodriver...")
             self.browser = await asyncio.wait_for(
                 uc.start(
-                    headless=False,
+                    headless=True,
                     no_sandbox=True,
                     browser_args=[
                         "--disable-setuid-sandbox",
@@ -167,15 +157,8 @@ class RemoteBrowserManager:
         except:
             pass
             
-        try:
-            if self.vdisplay:
-                self.vdisplay.stop()
-        except:
-            pass
-            
         self.browser = None
         self.page = None
-        self.vdisplay = None
 
 # Global instance
 browser_manager = RemoteBrowserManager()
