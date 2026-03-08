@@ -33,18 +33,27 @@ class RemoteBrowserManager:
             logger.warning(f"Xvfb not found, running without virtual display: {e}")
             self.vdisplay = None
         
-        # Quick Chrome health check - can it even start?
+        # Diagnostic: test Chrome in HEADFUL mode (no --headless) inside Xvfb
         try:
             import subprocess
-            result = subprocess.run(
-                ['chromium', '--headless', '--no-sandbox', '--dump-dom', 'about:blank'],
-                capture_output=True, text=True, timeout=10
+            # Test headful mode - if Chrome crashes, it exits immediately with stderr
+            proc = subprocess.Popen(
+                ['chromium', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
+                 '--no-first-run', '--remote-debugging-port=0', 'about:blank'],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
-            logger.info(f"Chrome health check exit code: {result.returncode}")
-            if result.returncode != 0:
-                logger.warning(f"Chrome health check stderr: {result.stderr[:500]}")
+            try:
+                # Wait 5 seconds - if Chrome exits, it crashed  
+                stdout, stderr = proc.communicate(timeout=5)
+                logger.error(f"Chrome HEADFUL crashed! Exit code: {proc.returncode}")
+                logger.error(f"Chrome stderr: {stderr.decode()[:1000]}")
+            except subprocess.TimeoutExpired:
+                # Chrome is still running after 5s = headful mode works!
+                logger.info("Chrome HEADFUL started OK (still running after 5s)")
+                proc.kill()
+                proc.wait()
         except Exception as e:
-            logger.warning(f"Chrome health check failed: {e}")
+            logger.warning(f"Chrome headful test failed: {e}")
         
         # Step 2: Start Chromium in headful mode inside Xvfb
         try:
