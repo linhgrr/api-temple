@@ -122,10 +122,16 @@ async def browser_websocket(websocket: WebSocket):
     send_task = asyncio.create_task(send_screenshots())
     recv_task = asyncio.create_task(receive_events())
 
-    done, pending = await asyncio.wait(
-        [send_task, recv_task],
-        return_when=asyncio.FIRST_COMPLETED
-    )
-
-    for task in pending:
-        task.cancel()
+    try:
+        # We don't want one task failing to instantly kill the other.
+        # Both tasks keep running as long as browser_manager.is_running is true.
+        await asyncio.gather(send_task, recv_task, return_exceptions=False)
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected by client.")
+    except Exception as e:
+        logger.error(f"WebSocket loop error: {e}")
+    finally:
+        logger.info("WebSocket connection closing, cleaning up tasks.")
+        for task in [send_task, recv_task]:
+            if not task.done():
+                task.cancel()
