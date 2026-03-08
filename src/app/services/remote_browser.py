@@ -1,6 +1,7 @@
 # src/app/services/remote_browser.py
 import asyncio
 import logging
+import os
 import base64
 from typing import Optional, Tuple
 import nodriver as uc
@@ -25,14 +26,29 @@ class RemoteBrowserManager:
         try:
             self.vdisplay = Xvfb(width=1024, height=768, colordepth=24)
             self.vdisplay.start()
-            logger.info("Xvfb virtual display started.")
+            display = os.environ.get('DISPLAY', 'NOT SET')
+            logger.info(f"Xvfb virtual display started. DISPLAY={display}")
+            await asyncio.sleep(1)  # Give Xvfb time to be fully ready
         except OSError as e:
             logger.warning(f"Xvfb not found, running without virtual display: {e}")
             self.vdisplay = None
         
+        # Quick Chrome health check - can it even start?
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['chromium', '--headless', '--no-sandbox', '--dump-dom', 'about:blank'],
+                capture_output=True, text=True, timeout=10
+            )
+            logger.info(f"Chrome health check exit code: {result.returncode}")
+            if result.returncode != 0:
+                logger.warning(f"Chrome health check stderr: {result.stderr[:500]}")
+        except Exception as e:
+            logger.warning(f"Chrome health check failed: {e}")
+        
         # Step 2: Start Chromium in headful mode inside Xvfb
         try:
-            logger.info("Initializing nodriver (headful mode)...")
+            logger.info(f"Initializing nodriver (headful mode), DISPLAY={os.environ.get('DISPLAY', 'NOT SET')}...")
             self.browser = await asyncio.wait_for(
                 uc.start(
                     headless=False,
