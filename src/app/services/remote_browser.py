@@ -20,29 +20,32 @@ class RemoteBrowserManager:
             return
         
         logger.info("Starting remote browser session via nodriver...")
+        
+        # Step 1: Try to start Xvfb virtual display (needed for "headful" mode in Docker)
         try:
-            # Start Xvfb virtual display
             self.vdisplay = Xvfb(width=1024, height=768, colordepth=24)
             self.vdisplay.start()
+            logger.info("Xvfb virtual display started.")
         except OSError as e:
             logger.warning(f"Xvfb not found, running without virtual display: {e}")
             self.vdisplay = None
-            
-            # Start Chromium via nodriver with timeout
+        
+        # Step 2: Start Chromium via nodriver (runs regardless of Xvfb success/failure)
+        try:
             logger.info("Initializing nodriver...")
             self.browser = await asyncio.wait_for(
                 uc.start(
-                    headless=False, # We want "headful" but in xvfb
+                    headless=False,
                     browser_args=[
                         "--no-sandbox",
                         "--disable-setuid-sandbox",
                         "--window-size=1024,768",
-                        "--disable-dev-shm-usage",     # Fixes crashes in Docker
-                        "--disable-gpu",               # Save memory
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
                         "--disable-software-rasterizer",
                     ]
                 ), 
-                timeout=15.0
+                timeout=30.0
             )
             
             logger.info("Browser process started, navigating to Google...")
@@ -50,31 +53,22 @@ class RemoteBrowserManager:
             try:
                 self.page = await asyncio.wait_for(
                     self.browser.get("https://accounts.google.com/ServiceLogin"),
-                    timeout=15.0
+                    timeout=30.0
                 )
             except Exception as get_err:
-                logger.warning(f"Browser get() threw an error, trying to get main tab manually: {get_err}")
-                try:
-                    # In some environments, nodriver drops the internal CDP HTTP connection due to IPv6/IPv4 
-                    # localhost conflict, resulting in 'Connection refused'. We fallback to picking the 
-                    # main tab.
-                    self.page = self.browser.main_tab
-                    if self.page:
-                        # Use raw CDP navigation which goes through the WS stream instead of HTTP
-                        await self.page.send(uc.cdp.page.navigate(url="https://accounts.google.com/ServiceLogin"))
-                    else:
-                        raise get_err
-                except Exception as inner_e:
-                    logger.error(f"Fallback navigation also failed: {inner_e}")
-                    raise inner_e
+                logger.warning(f"Browser get() error, trying main_tab fallback: {get_err}")
+                self.page = self.browser.main_tab
+                if self.page:
+                    await self.page.send(uc.cdp.page.navigate(url="https://accounts.google.com/ServiceLogin"))
+                    await asyncio.sleep(3)
+                else:
+                    raise get_err
             
-            # Additional safety to wait for network/idle 
-            # to make sure the page is completely present before websocket starts sending
             if self.page:
                 try:
                     await asyncio.wait_for(self.page.bring_to_front(), timeout=5.0)
-                except Exception as e:
-                    logger.warning(f"bring_to_front failed: {e}")
+                except Exception:
+                    pass
             await asyncio.sleep(2)
             
             self.is_running = True
