@@ -36,8 +36,8 @@ class RemoteBrowserManager:
             self.browser = await asyncio.wait_for(
                 uc.start(
                     headless=False,
+                    no_sandbox=True,
                     browser_args=[
-                        "--no-sandbox",
                         "--disable-setuid-sandbox",
                         "--window-size=1024,768",
                         "--disable-dev-shm-usage",
