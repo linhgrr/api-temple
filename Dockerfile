@@ -9,8 +9,8 @@ COPY requirements.txt .
 RUN pip install --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browser and system dependencies
-RUN playwright install chromium --with-deps
+# Install Xvfb and Chromium for headless/nodriver support
+RUN apt-get update && apt-get install -y xvfb chromium procps && rm -rf /var/lib/apt/lists/*
 
 # Copy project files
 COPY . .
