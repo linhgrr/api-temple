@@ -22,12 +22,14 @@ async def _patched_send(self, request, *args, **kwargs):
             proxy_url = proxy_url.rstrip("/")
             original_url = str(request.url)
             
+            # Force HTTPS to skip Ngrok 307 warn redirects on HTTP
+            secure_proxy_url = proxy_url.replace("http://", "https://")
+            
             # Rewrite URL to point to the Ngrok proxy
-            new_url = original_url.replace("https://gemini.google.com", proxy_url)
+            new_url = original_url.replace("https://gemini.google.com", secure_proxy_url)
             logger.info(f"Reverse Proxying {request.method} to {new_url}")
             
             # Create a completely new proxy request with the modified URL
-            # We strip out the `self.proxies` by recreating the URL locally
             request.url = httpx.URL(new_url)
             request.headers["Host"] = httpx.URL(proxy_url).host
             request.headers["ngrok-skip-browser-warning"] = "1"
@@ -39,6 +41,7 @@ async def _patched_send(self, request, *args, **kwargs):
 
 httpx.AsyncClient.send = _patched_send
 # ----------------------------------------------------------------
+
 class GeminiClientNotInitializedError(Exception):
     """Raised when the Gemini client is not initialized or initialization failed."""
     pass
@@ -72,9 +75,16 @@ async def init_gemini_client() -> bool:
 
             if gemini_proxy == "":
                 gemini_proxy = None
+                
+            # DO NOT pass ngrok proxy strings to gemini_webapi framework
+            # Otherwise httpx attempts an HTTP CONNECT through the reverse proxy!
+            # Our _patched_send monkeypatch handles everything seamlessly.
+            actual_proxy = gemini_proxy
+            if gemini_proxy and "ngrok-free" in gemini_proxy:
+                actual_proxy = None
 
             if gemini_cookie_1PSID and gemini_cookie_1PSIDTS:
-                _gemini_client = MyGeminiClient(secure_1psid=gemini_cookie_1PSID, secure_1psidts=gemini_cookie_1PSIDTS, proxy=gemini_proxy)
+                _gemini_client = MyGeminiClient(secure_1psid=gemini_cookie_1PSID, secure_1psidts=gemini_cookie_1PSIDTS, proxy=actual_proxy)
                 await _gemini_client.init()
                 logger.info("Gemini client initialized successfully.")
                 return True
