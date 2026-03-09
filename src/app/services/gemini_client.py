@@ -5,67 +5,45 @@ from app.config import CONFIG, write_config
 from app.logger import logger
 from app.utils.browser import get_cookie_from_browser
 
-import httpx
 # Import the specific exception to handle it gracefully
 from gemini_webapi.exceptions import AuthError
+from gemini_webapi.constants import Endpoint, Headers
 
-_ACTIVE_NGROK_PROXY = None
+# --- Ngrok Reverse Proxy: patch gemini_webapi constants directly ---
+# Instead of monkeypatching httpx (fragile), we simply rewrite the
+# endpoint URLs that the library uses. This way ALL internal clients,
+# ephemeral or not, naturally send requests to our Ngrok reverse proxy.
 
-# --- Monkeypatch httpx to route through our Ngrok REVERSE Proxy ---
-_original_async_client_init = httpx.AsyncClient.__init__
+_ORIGINAL_ENDPOINTS = {
+    "INIT": str(Endpoint.INIT),
+    "GENERATE": str(Endpoint.GENERATE),
+    "BATCH_EXEC": str(Endpoint.BATCH_EXEC),
+}
 
-def _patched_async_client_init(self, *args, **kwargs):
-    global _ACTIVE_NGROK_PROXY
+def _apply_ngrok_proxy(proxy_url: str):
+    """Rewrite gemini_webapi endpoint constants to route through Ngrok reverse proxy."""
+    proxy_url = proxy_url.rstrip("/")
+    # Force HTTPS to avoid Ngrok 307 redirect
+    secure = proxy_url.replace("http://", "https://")
     
-    # Run the original init first
-    _original_async_client_init(self, *args, **kwargs)
+    # Use type.__setattr__ to bypass Enum's immutability protection
+    type.__setattr__(Endpoint, "INIT", _ORIGINAL_ENDPOINTS["INIT"].replace("https://gemini.google.com", secure))
+    type.__setattr__(Endpoint, "GENERATE", _ORIGINAL_ENDPOINTS["GENERATE"].replace("https://gemini.google.com", secure))
+    type.__setattr__(Endpoint, "BATCH_EXEC", _ORIGINAL_ENDPOINTS["BATCH_EXEC"].replace("https://gemini.google.com", secure))
     
-    # Now we patch the specific 'send' method of THIS newly created instance.
-    # This guarantees that even if gemini_webapi makes a completely new AsyncClient
-    # internally (e.g. for uploads or batch executes), it gets our proxy interceptor!
-    _original_send = getattr(self, "send", self.__class__.send)
+    # Patch default headers to include ngrok-skip-browser-warning
+    headers = dict(Headers.GEMINI.value)
+    headers["ngrok-skip-browser-warning"] = "1"
+    Headers.GEMINI._value_ = headers
     
-    async def _bound_patched_send(request, *s_args, **s_kwargs):
-        if "gemini.google.com" in str(request.url):
-            proxy_url = _ACTIVE_NGROK_PROXY
-            
-            # If proxy is an ngrok HTTP tunnel, use reverse proxy strategy
-            if proxy_url and proxy_url.startswith("http") and "ngrok-free" in proxy_url:
-                proxy_url = proxy_url.rstrip("/")
-                original_url = str(request.url)
-                
-                # Force HTTPS to skip Ngrok 307 warn redirects on HTTP
-                secure_proxy_url = proxy_url.replace("http://", "https://")
-                
-                # Rewrite URL to point to the Ngrok proxy
-                new_url = original_url.replace("https://gemini.google.com", secure_proxy_url)
-                logger.info(f"Reverse Proxying {request.method} to {new_url}")
-                
-                # Create a completely new proxy request with the modified URL
-                request.url = httpx.URL(new_url)
-                request.headers["Host"] = httpx.URL(proxy_url).host
-                request.headers["ngrok-skip-browser-warning"] = "1"
-                
-                # Wipe HTTP CONNECT proxy logic from this instance specifically for this request
-                old_proxies = getattr(self, "_proxies", None)
-                old_mounts = getattr(self, "_mounts", None)
-                setattr(self, "_proxies", {})
-                setattr(self, "_mounts", {})
-                
-                try:
-                    return await _original_send(request, *s_args, **s_kwargs)
-                finally:
-                    if old_proxies is not None:
-                        setattr(self, "_proxies", old_proxies)
-                    if old_mounts is not None:
-                        setattr(self, "_mounts", old_mounts)
+    logger.info(f"Ngrok reverse proxy activated: endpoints rewritten to {secure}")
 
-        return await _original_send(request, *s_args, **s_kwargs)
-        
-    # Bind the patched send to this instance!
-    self.send = _bound_patched_send
+def _reset_endpoints():
+    """Restore original endpoint URLs."""
+    type.__setattr__(Endpoint, "INIT", _ORIGINAL_ENDPOINTS["INIT"])
+    type.__setattr__(Endpoint, "GENERATE", _ORIGINAL_ENDPOINTS["GENERATE"])
+    type.__setattr__(Endpoint, "BATCH_EXEC", _ORIGINAL_ENDPOINTS["BATCH_EXEC"])
 
-httpx.AsyncClient.__init__ = _patched_async_client_init
 # ----------------------------------------------------------------
 
 class GeminiClientNotInitializedError(Exception):
@@ -84,7 +62,7 @@ async def init_gemini_client() -> bool:
     Initialize and set up the Gemini client based on the configuration.
     Returns True on success, False on failure.
     """
-    global _gemini_client, _initialization_error, _error_code, _ACTIVE_NGROK_PROXY
+    global _gemini_client, _initialization_error, _error_code
     _initialization_error = None
     _error_code = None
 
@@ -102,15 +80,14 @@ async def init_gemini_client() -> bool:
             if gemini_proxy == "":
                 gemini_proxy = None
                 
-            # If using ngrok, save to global variable so patched requests know what to reroute.
-            _ACTIVE_NGROK_PROXY = gemini_proxy
-                
-            # DO NOT pass ngrok proxy strings to gemini_webapi framework
-            # Otherwise httpx attempts an HTTP CONNECT through the reverse proxy!
-            # Our _patched_send monkeypatch handles everything seamlessly.
+            # If using ngrok, rewrite library constants to route through reverse proxy
+            # and don't pass proxy to httpx (no CONNECT needed)
             actual_proxy = gemini_proxy
             if gemini_proxy and "ngrok-free" in gemini_proxy:
+                _apply_ngrok_proxy(gemini_proxy)
                 actual_proxy = None
+            else:
+                _reset_endpoints()
 
             if gemini_cookie_1PSID and gemini_cookie_1PSIDTS:
                 _gemini_client = MyGeminiClient(secure_1psid=gemini_cookie_1PSID, secure_1psidts=gemini_cookie_1PSIDTS, proxy=actual_proxy)
