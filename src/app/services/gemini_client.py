@@ -1,5 +1,6 @@
 # src/app/services/gemini_client.py
 import asyncio
+import os
 from models.gemini import MyGeminiClient
 from app.config import CONFIG, write_config
 from app.logger import logger
@@ -7,43 +8,52 @@ from app.utils.browser import get_cookie_from_browser
 
 # Import the specific exception to handle it gracefully
 from gemini_webapi.exceptions import AuthError
-from gemini_webapi.constants import Endpoint, Headers
+import httpx
+from urllib.parse import urlparse
 
-# --- Ngrok Reverse Proxy: patch gemini_webapi constants directly ---
-# Instead of monkeypatching httpx (fragile), we simply rewrite the
-# endpoint URLs that the library uses. This way ALL internal clients,
-# ephemeral or not, naturally send requests to our Ngrok reverse proxy.
+_ACTIVE_NGROK_PROXY = None
 
-_ORIGINAL_ENDPOINTS = {
-    "INIT": str(Endpoint.INIT),
-    "GENERATE": str(Endpoint.GENERATE),
-    "BATCH_EXEC": str(Endpoint.BATCH_EXEC),
-}
+# --- Monkeypatch httpx to route through our Ngrok REVERSE Proxy ---
+# We patch at the lowest Transport layer so that `httpx` evaluates the original `gemini.google.com`
+# URL against the CookieJar FIRST. This ensures `.google.com` cookies are securely attached 
+# to the headers BEFORE we hijack the socket connection to send it to our Ngrok reverse proxy.
+_original_handle_async_request = httpx.AsyncHTTPTransport.handle_async_request
 
-def _apply_ngrok_proxy(proxy_url: str):
-    """Rewrite gemini_webapi endpoint constants to route through Ngrok reverse proxy."""
-    proxy_url = proxy_url.rstrip("/")
-    # Force HTTPS to avoid Ngrok 307 redirect
-    secure = proxy_url.replace("http://", "https://")
+async def _patched_handle_async_request(self, request, *args, **kwargs):
+    global _ACTIVE_NGROK_PROXY
+    proxy_url = _ACTIVE_NGROK_PROXY
     
-    # Use type.__setattr__ to bypass Enum's immutability protection
-    type.__setattr__(Endpoint, "INIT", _ORIGINAL_ENDPOINTS["INIT"].replace("https://gemini.google.com", secure))
-    type.__setattr__(Endpoint, "GENERATE", _ORIGINAL_ENDPOINTS["GENERATE"].replace("https://gemini.google.com", secure))
-    type.__setattr__(Endpoint, "BATCH_EXEC", _ORIGINAL_ENDPOINTS["BATCH_EXEC"].replace("https://gemini.google.com", secure))
-    
-    # Patch default headers to include ngrok-skip-browser-warning
-    headers = dict(Headers.GEMINI.value)
-    headers["ngrok-skip-browser-warning"] = "1"
-    Headers.GEMINI._value_ = headers
-    
-    logger.info(f"Ngrok reverse proxy activated: endpoints rewritten to {secure}")
+    if proxy_url and ("ngrok" in proxy_url or "trycloudflare" in proxy_url):
+        original_url = str(request.url)
+        
+        if "gemini.google.com" in original_url or "www.google.com" in original_url:
+            proxy_url = proxy_url.rstrip("/")
+            secure_proxy_url = proxy_url.replace("http://", "https://")
+            parsed_proxy = urlparse(secure_proxy_url)
+            
+            parsed_original = urlparse(original_url)
+            
+            # Rewrite URL to HTTPS proxy (Ngrok forces HTTPS)
+            new_url = original_url.replace(f"https://{parsed_original.netloc}", secure_proxy_url)
+            logger.info(f"Reverse Proxying Transport: {request.method} {new_url}")
+            
+            request.url = httpx.URL(new_url)
+            # Host must match TLS SNI (= Ngrok hostname), otherwise 421
+            request.headers["Host"] = parsed_proxy.netloc
+            # Pass original host so home_proxy.py can restore it for Google
+            request.headers["X-Forwarded-Host"] = parsed_original.netloc
+            request.headers["ngrok-skip-browser-warning"] = "1"
+            
+            # Ngrok free tier doesn't support HTTP/2, use a shared HTTP/1.1 transport
+            global _http1_transport
+            if _http1_transport is None:
+                _http1_transport = httpx.AsyncHTTPTransport(http2=False)
+            return await _http1_transport.handle_async_request(request)
+            
+    return await _original_handle_async_request(self, request, *args, **kwargs)
 
-def _reset_endpoints():
-    """Restore original endpoint URLs."""
-    type.__setattr__(Endpoint, "INIT", _ORIGINAL_ENDPOINTS["INIT"])
-    type.__setattr__(Endpoint, "GENERATE", _ORIGINAL_ENDPOINTS["GENERATE"])
-    type.__setattr__(Endpoint, "BATCH_EXEC", _ORIGINAL_ENDPOINTS["BATCH_EXEC"])
-
+_http1_transport = None
+httpx.AsyncHTTPTransport.handle_async_request = _patched_handle_async_request
 # ----------------------------------------------------------------
 
 class GeminiClientNotInitializedError(Exception):
@@ -62,7 +72,7 @@ async def init_gemini_client() -> bool:
     Initialize and set up the Gemini client based on the configuration.
     Returns True on success, False on failure.
     """
-    global _gemini_client, _initialization_error, _error_code
+    global _gemini_client, _initialization_error, _error_code, _ACTIVE_NGROK_PROXY
     _initialization_error = None
     _error_code = None
 
@@ -70,7 +80,12 @@ async def init_gemini_client() -> bool:
         try:
             gemini_cookie_1PSID = CONFIG["Cookies"].get("gemini_cookie_1PSID")
             gemini_cookie_1PSIDTS = CONFIG["Cookies"].get("gemini_cookie_1PSIDTS")
-            gemini_proxy = CONFIG["Proxy"].get("http_proxy")
+            # Resolve proxy: config value → env var fallback
+            gemini_proxy = CONFIG["Proxy"].get("http_proxy") or ""
+            if not gemini_proxy:
+                gemini_proxy = os.environ.get("NGROK_PROXY_URL", "")
+                if gemini_proxy:
+                    logger.info(f"Using NGROK_PROXY_URL from env: {gemini_proxy}")
 
             if not gemini_cookie_1PSID or not gemini_cookie_1PSIDTS:
                 cookies = get_cookie_from_browser("gemini")
@@ -79,15 +94,23 @@ async def init_gemini_client() -> bool:
 
             if gemini_proxy == "":
                 gemini_proxy = None
+
+            logger.info(f"Proxy config resolved to: {gemini_proxy!r}")
                 
-            # If using ngrok, rewrite library constants to route through reverse proxy
-            # and don't pass proxy to httpx (no CONNECT needed)
+            # If using ngrok/cloudflare tunnel, the Transport hook natively intercepts
+            # these requests right before execution.
+            _ACTIVE_NGROK_PROXY = gemini_proxy
             actual_proxy = gemini_proxy
-            if gemini_proxy and "ngrok-free" in gemini_proxy:
-                _apply_ngrok_proxy(gemini_proxy)
+            
+            if gemini_proxy and ("ngrok" in gemini_proxy or "trycloudflare" in gemini_proxy):
+                # We do NOT pass the proxy to httpx to prevent HTTP CONNECT requests
                 actual_proxy = None
+                logger.info(f"Active Reverse Proxy set to: {gemini_proxy}")
             else:
-                _reset_endpoints()
+                if gemini_proxy:
+                    logger.info(f"Using standard HTTP proxy: {gemini_proxy}")
+                else:
+                    logger.info("No proxy configured — calling Google directly.")
 
             if gemini_cookie_1PSID and gemini_cookie_1PSIDTS:
                 _gemini_client = MyGeminiClient(secure_1psid=gemini_cookie_1PSID, secure_1psidts=gemini_cookie_1PSIDTS, proxy=actual_proxy)
