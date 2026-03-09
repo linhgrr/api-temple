@@ -5,58 +5,35 @@ from app.config import CONFIG, write_config
 from app.logger import logger
 from app.utils.browser import get_cookie_from_browser
 
-import base64
 import httpx
 # Import the specific exception to handle it gracefully
 from gemini_webapi.exceptions import AuthError
 
-# --- Monkeypatch httpx to route through our Ngrok RPC Bridge ---
+# --- Monkeypatch httpx to route through our Ngrok REVERSE Proxy ---
 _original_send = httpx.AsyncClient.send
 
 async def _patched_send(self, request, *args, **kwargs):
     if "gemini.google.com" in str(request.url):
         # Read the proxy configuration dynamically
         proxy_url = CONFIG["Proxy"].get("http_proxy", "")
-        # If proxy is an ngrok HTTP tunnel, use RPC strategy
+        # If proxy is an ngrok HTTP tunnel, use reverse proxy strategy
         if proxy_url and proxy_url.startswith("http") and "ngrok-free" in proxy_url:
-            # Strip trailing slash and append /rpc
-            rpc_url = proxy_url.rstrip("/") + "/rpc"
-            logger.info(f"Using Ngrok HTTP RPC bridge for {request.method} {request.url}")
+            # Strip trailing slash
+            proxy_url = proxy_url.rstrip("/")
+            original_url = str(request.url)
             
-            # Read request body
-            body_bytes = request.read() if hasattr(request, "read") else request.content
+            # Rewrite URL to point to the Ngrok proxy
+            new_url = original_url.replace("https://gemini.google.com", proxy_url)
+            logger.info(f"Reverse Proxying {request.method} to {new_url}")
             
-            rpc_req = {
-                "method": request.method,
-                "url": str(request.url),
-                "headers": dict(request.headers),
-                "body": base64.b64encode(body_bytes).decode('ascii') if body_bytes else None
-            }
+            # Create a completely new proxy request with the modified URL
+            # We strip out the `self.proxies` by recreating the URL locally
+            request.url = httpx.URL(new_url)
+            request.headers["Host"] = httpx.URL(proxy_url).host
+            request.headers["ngrok-skip-browser-warning"] = "1"
             
-            proxy_request = self.build_request(
-                "POST", rpc_url, 
-                json=rpc_req, 
-                headers={"ngrok-skip-browser-warning": "1"}
-            )
-            
-            resp = await _original_send(self, proxy_request, *args, **kwargs)
-            
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                    # Reconstruct original response
-                    return httpx.Response(
-                        data["status_code"],
-                        headers=data["headers"],
-                        content=base64.b64decode(data["body"]) if data["body"] else b"",
-                        request=request
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to parse RPC response: {e} - Content: {resp.text}")
-                    return resp
-            else:
-                logger.error(f"RPC Proxy failed: HTTP {resp.status_code} - {resp.text}")
-                return resp
+            # Now we send it natively! No HTTP CONNECT proxying, just a regular request
+            return await _original_send(self, request, *args, **kwargs)
 
     return await _original_send(self, request, *args, **kwargs)
 
