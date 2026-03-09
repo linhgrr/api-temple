@@ -55,23 +55,55 @@ class RemoteBrowserManager:
         except Exception as e:
             logger.warning(f"Chrome headful test failed: {e}")
         
+        # Setup longer wait for browser to start (monkeypatch nodriver hardcoded 5 attempts)
+        original_start = uc.core.browser.Browser.start
+        async def patched_start(self=None):
+            # Same as original start but we increase the retry count
+            # We catch the exact place where HTTP polling happens
+            pass # We will just patch the httpx timeout or use a simpler trick
+        
+        # Actually the easiest way to bypass nodriver's hardcoded 5 retries is to 
+        # let it fail, but we catch it and directly initialize the connection ourselves, 
+        # or we just monkey-patch `asyncio.sleep` momentarily inside `uc.start()`?
+        # A cleaner way is to just patch the loop count in the method if possible, 
+        # but since we can't easily rewrite the AST, we will monkeypatch HTTP get.
+
         # Step 2: Start Chromium in headful mode inside Xvfb
         try:
             logger.info(f"Initializing nodriver (headful mode), DISPLAY={os.environ.get('DISPLAY', 'NOT SET')}...")
-            self.browser = await asyncio.wait_for(
-                uc.start(
-                    headless=False,
-                    no_sandbox=True,
-                    browser_args=[
-                        "--disable-setuid-sandbox",
-                        "--window-size=1024,768",
-                        "--disable-dev-shm-usage",
-                        "--disable-gpu",
-                        "--disable-software-rasterizer",
-                    ]
-                ), 
-                timeout=30.0
-            )
+            
+            # Monkeypatch HTTPApi.get to wait longer internally
+            original_http_get = uc.core.connection.HTTPApi.get
+            async def patched_http_get(*args, **kwargs):
+                for attempt in range(20): # 20 attempts * 0.5s = 10s wait
+                    try:
+                        return await original_http_get(*args, **kwargs)
+                    except Exception as e:
+                        if attempt == 19:
+                            raise
+                        await asyncio.sleep(0.5)
+            
+            uc.core.connection.HTTPApi.get = patched_http_get
+            
+            try:
+                self.browser = await asyncio.wait_for(
+                    uc.start(
+                        headless=False,
+                        no_sandbox=True,
+                        host="127.0.0.1",
+                        browser_args=[
+                            "--disable-setuid-sandbox",
+                            "--window-size=1024,768",
+                            "--disable-dev-shm-usage",
+                            "--disable-gpu",
+                            "--disable-software-rasterizer",
+                        ]
+                    ), 
+                    timeout=30.0
+                )
+            finally:
+                # Restore original method
+                uc.core.connection.HTTPApi.get = original_http_get
             
             logger.info("Browser process started, navigating to Google...")
             
