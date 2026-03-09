@@ -9,37 +9,63 @@ import httpx
 # Import the specific exception to handle it gracefully
 from gemini_webapi.exceptions import AuthError
 
+_ACTIVE_NGROK_PROXY = None
+
 # --- Monkeypatch httpx to route through our Ngrok REVERSE Proxy ---
-_original_send = httpx.AsyncClient.send
+_original_async_client_init = httpx.AsyncClient.__init__
 
-async def _patched_send(self, request, *args, **kwargs):
-    if "gemini.google.com" in str(request.url):
-        # Read the proxy configuration dynamically
-        proxy_url = CONFIG["Proxy"].get("http_proxy", "")
-        # If proxy is an ngrok HTTP tunnel, use reverse proxy strategy
-        if proxy_url and proxy_url.startswith("http") and "ngrok-free" in proxy_url:
-            # Strip trailing slash
-            proxy_url = proxy_url.rstrip("/")
-            original_url = str(request.url)
+def _patched_async_client_init(self, *args, **kwargs):
+    global _ACTIVE_NGROK_PROXY
+    
+    # Run the original init first
+    _original_async_client_init(self, *args, **kwargs)
+    
+    # Now we patch the specific 'send' method of THIS newly created instance.
+    # This guarantees that even if gemini_webapi makes a completely new AsyncClient
+    # internally (e.g. for uploads or batch executes), it gets our proxy interceptor!
+    _original_send = getattr(self, "send", self.__class__.send)
+    
+    async def _bound_patched_send(request, *s_args, **s_kwargs):
+        if "gemini.google.com" in str(request.url):
+            proxy_url = _ACTIVE_NGROK_PROXY
             
-            # Force HTTPS to skip Ngrok 307 warn redirects on HTTP
-            secure_proxy_url = proxy_url.replace("http://", "https://")
-            
-            # Rewrite URL to point to the Ngrok proxy
-            new_url = original_url.replace("https://gemini.google.com", secure_proxy_url)
-            logger.info(f"Reverse Proxying {request.method} to {new_url}")
-            
-            # Create a completely new proxy request with the modified URL
-            request.url = httpx.URL(new_url)
-            request.headers["Host"] = httpx.URL(proxy_url).host
-            request.headers["ngrok-skip-browser-warning"] = "1"
-            
-            # Now we send it natively! No HTTP CONNECT proxying, just a regular request
-            return await _original_send(self, request, *args, **kwargs)
+            # If proxy is an ngrok HTTP tunnel, use reverse proxy strategy
+            if proxy_url and proxy_url.startswith("http") and "ngrok-free" in proxy_url:
+                proxy_url = proxy_url.rstrip("/")
+                original_url = str(request.url)
+                
+                # Force HTTPS to skip Ngrok 307 warn redirects on HTTP
+                secure_proxy_url = proxy_url.replace("http://", "https://")
+                
+                # Rewrite URL to point to the Ngrok proxy
+                new_url = original_url.replace("https://gemini.google.com", secure_proxy_url)
+                logger.info(f"Reverse Proxying {request.method} to {new_url}")
+                
+                # Create a completely new proxy request with the modified URL
+                request.url = httpx.URL(new_url)
+                request.headers["Host"] = httpx.URL(proxy_url).host
+                request.headers["ngrok-skip-browser-warning"] = "1"
+                
+                # Wipe HTTP CONNECT proxy logic from this instance specifically for this request
+                old_proxies = getattr(self, "_proxies", None)
+                old_mounts = getattr(self, "_mounts", None)
+                setattr(self, "_proxies", {})
+                setattr(self, "_mounts", {})
+                
+                try:
+                    return await _original_send(request, *s_args, **s_kwargs)
+                finally:
+                    if old_proxies is not None:
+                        setattr(self, "_proxies", old_proxies)
+                    if old_mounts is not None:
+                        setattr(self, "_mounts", old_mounts)
 
-    return await _original_send(self, request, *args, **kwargs)
+        return await _original_send(request, *s_args, **s_kwargs)
+        
+    # Bind the patched send to this instance!
+    self.send = _bound_patched_send
 
-httpx.AsyncClient.send = _patched_send
+httpx.AsyncClient.__init__ = _patched_async_client_init
 # ----------------------------------------------------------------
 
 class GeminiClientNotInitializedError(Exception):
@@ -58,7 +84,7 @@ async def init_gemini_client() -> bool:
     Initialize and set up the Gemini client based on the configuration.
     Returns True on success, False on failure.
     """
-    global _gemini_client, _initialization_error, _error_code
+    global _gemini_client, _initialization_error, _error_code, _ACTIVE_NGROK_PROXY
     _initialization_error = None
     _error_code = None
 
@@ -75,6 +101,9 @@ async def init_gemini_client() -> bool:
 
             if gemini_proxy == "":
                 gemini_proxy = None
+                
+            # If using ngrok, save to global variable so patched requests know what to reroute.
+            _ACTIVE_NGROK_PROXY = gemini_proxy
                 
             # DO NOT pass ngrok proxy strings to gemini_webapi framework
             # Otherwise httpx attempts an HTTP CONNECT through the reverse proxy!
