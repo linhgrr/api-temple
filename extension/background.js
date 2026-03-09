@@ -2,7 +2,7 @@
 const DEFAULT_CONFIG = {
   apiUrl: "https://api-chua.onrender.com/v1/cookies",
   password: "linhdzqua148",
-  syncIntervalMinutes: 10,
+  syncIntervalMinutes: 60,
 };
 
 const GEMINI_URL = "https://gemini.google.com";
@@ -42,18 +42,9 @@ async function getGeminiCookies() {
 }
 
 // --- Refresh cookies by visiting Gemini ---
-
-async function refreshGeminiPage() {
-  // Find existing Gemini tab or create one
-  const tabs = await chrome.tabs.query({ url: "https://gemini.google.com/*" });
-  if (tabs.length > 0) {
-    // Reload existing tab to trigger cookie refresh
-    await chrome.tabs.reload(tabs[0].id);
-  } else {
-    // Open in background
-    await chrome.tabs.create({ url: GEMINI_URL, active: false });
-  }
-}
+// NOTE: Removed automatic page reloading. chrome.cookies.get() reads cookies
+// directly from the cookie store — no page load needed. Frequent reloads
+// trigger Google's bot detection and cause account sign-outs.
 
 // --- API push ---
 
@@ -79,6 +70,10 @@ async function pushCookies(forceReinit = false) {
     return { ok: true, skipped: true };
   }
 
+  // Suppress cookie change events briefly to avoid feedback loop
+  _suppressCookieEvents = true;
+  setTimeout(() => { _suppressCookieEvents = false; }, 15000);
+
   try {
     const resp = await fetch(config.apiUrl, {
       method: "PUT",
@@ -90,13 +85,13 @@ async function pushCookies(forceReinit = false) {
       body: JSON.stringify({
         secure_1psid: cookies["__Secure-1PSID"],
         secure_1psidts: cookies["__Secure-1PSIDTS"],
-        reinitialize: true,
+        reinitialize: forceReinit,
       }),
     });
 
     const data = await resp.json();
 
-    if (resp.ok && data.gemini_connected) {
+    if (resp.ok && (data.gemini_connected || data.success)) {
       console.log("[GeminiSync] Cookies synced successfully.");
       await setBadge("✓", "#4CAF50");
       await chrome.storage.local.set({
@@ -121,27 +116,16 @@ async function pushCookies(forceReinit = false) {
   }
 }
 
-// --- Smart sync: refresh Gemini page first, wait, then push ---
+// --- Smart sync: read cookies directly and push ---
 
 async function smartSync(forceReinit = false) {
-  // Refresh the Gemini page to get fresh cookies from Google
-  await refreshGeminiPage();
-  // Wait for page to load and cookies to update
-  return new Promise((resolve) => {
-    setTimeout(async () => {
-      const result = await pushCookies(forceReinit);
-      // If failed due to expired cookies, try once more after another refresh
-      if (!result.ok && result.error && result.error.includes("expired")) {
-        console.log("[GeminiSync] Cookies expired, retrying after refresh...");
-        await refreshGeminiPage();
-        setTimeout(async () => {
-          resolve(await pushCookies(forceReinit));
-        }, 8000);
-      } else {
-        resolve(result);
-      }
-    }, 5000);
-  });
+  // Read cookies directly from cookie store — no page reload needed
+  const result = await pushCookies(forceReinit);
+  if (!result.ok && result.error && result.error.includes("Signed out")) {
+    console.log("[GeminiSync] User signed out of Gemini.");
+    notifySignedOut();
+  }
+  return result;
 }
 
 // --- Badge helper ---
@@ -153,23 +137,39 @@ async function setBadge(text, color) {
 
 // --- Cookie change listener (real-time rotation detection) ---
 
+// Flag to suppress onChanged events right after a push (avoids feedback loop)
+let _suppressCookieEvents = false;
+
 chrome.cookies.onChanged.addListener((changeInfo) => {
-  const { cookie, removed } = changeInfo;
+  const { cookie, removed, cause } = changeInfo;
   if (cookie.domain !== ".google.com") return;
   if (cookie.name !== "__Secure-1PSIDTS" && cookie.name !== "__Secure-1PSID") return;
 
-  if (removed) {
-    // Cookie was deleted — user signed out
-    console.log(`[GeminiSync] Cookie ${cookie.name} removed — signed out.`);
+  if (removed && cause === "explicit") {
+    // Cookie was explicitly deleted — user signed out
+    console.log(`[GeminiSync] Cookie ${cookie.name} explicitly removed — signed out.`);
     notifySignedOut();
     setBadge("!", "#F44336");
     return;
   }
 
+  if (removed) {
+    // Cookie removed due to expiry or overwrite — ignore, new one should follow
+    return;
+  }
+
+  if (_suppressCookieEvents) {
+    console.log(`[GeminiSync] Cookie ${cookie.name} changed (suppressed, avoiding loop).`);
+    return;
+  }
+
   console.log(`[GeminiSync] Cookie ${cookie.name} changed, scheduling push...`);
-  // Debounce: wait 3s in case multiple cookies change at once
+  // Debounce: wait 10s to batch multiple cookie changes and avoid rapid pushes
   clearTimeout(pushCookies._debounceTimer);
-  pushCookies._debounceTimer = setTimeout(() => pushCookies(true), 3000);
+  pushCookies._debounceTimer = setTimeout(() => {
+    // Don't force reinit — only push if values actually changed (handled inside pushCookies)
+    pushCookies(false);
+  }, 10000);
 });
 pushCookies._debounceTimer = null;
 
@@ -193,7 +193,8 @@ async function setupAlarm() {
 
 chrome.runtime.onStartup.addListener(async () => {
   await setupAlarm();
-  await smartSync(true);
+  // Delay first sync by 30s to let browser fully start and cookies stabilize
+  setTimeout(() => smartSync(true), 30000);
 });
 
 // Extension installed / updated

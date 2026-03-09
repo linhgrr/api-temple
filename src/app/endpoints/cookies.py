@@ -191,7 +191,18 @@ async def set_cookies(request: SetCookiesRequest):
         else:
             msg = f"Cookies saved but connection failed: {status.get('error', 'unknown error')}"
     else:
-        msg = "Cookies saved to config. Client not reinitialized (reinitialize=false)."
+        # Update in-memory cookies of the running client without full reinit.
+        # This avoids hitting Google auth endpoints while keeping cookies fresh.
+        try:
+            client = get_gemini_client()
+            client.client.cookies.set("__Secure-1PSID", request.secure_1psid, domain=".google.com")
+            client.client.cookies.set("__Secure-1PSIDTS", request.secure_1psidts, domain=".google.com")
+            connected = True
+            msg = "Cookies saved and updated in running client (no reinit)."
+            logger.info(msg)
+        except GeminiClientNotInitializedError:
+            connected = False
+            msg = "Cookies saved to config. Client not running — reinitialize to connect."
 
     return SetCookiesResponse(
         success=connected or not request.reinitialize,
