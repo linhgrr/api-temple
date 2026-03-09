@@ -73,7 +73,7 @@ class RemoteBrowserManager:
             logger.info(f"Initializing nodriver (headful mode), DISPLAY={os.environ.get('DISPLAY', 'NOT SET')}...")
             
             # Monkeypatch HTTPApi.get to wait longer internally
-            original_http_get = uc.core.connection.HTTPApi.get
+            original_http_get = uc.core.browser.HTTPApi.get
             async def patched_http_get(*args, **kwargs):
                 for attempt in range(20): # 20 attempts * 0.5s = 10s wait
                     try:
@@ -83,7 +83,7 @@ class RemoteBrowserManager:
                             raise
                         await asyncio.sleep(0.5)
             
-            uc.core.connection.HTTPApi.get = patched_http_get
+            uc.core.browser.HTTPApi.get = patched_http_get
             
             try:
                 self.browser = await asyncio.wait_for(
@@ -103,7 +103,7 @@ class RemoteBrowserManager:
                 )
             finally:
                 # Restore original method
-                uc.core.connection.HTTPApi.get = original_http_get
+                uc.core.browser.HTTPApi.get = original_http_get
             
             logger.info("Browser process started, navigating to Google...")
             
