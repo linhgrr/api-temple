@@ -27,14 +27,17 @@ async def _patched_handle_async_request(self, request, *args, **kwargs):
         original_url = str(request.url)
         
         if "gemini.google.com" in original_url or "www.google.com" in original_url:
-            proxy_url = proxy_url.rstrip("/")
-            secure_proxy_url = proxy_url.replace("http://", "https://")
-            parsed_proxy = urlparse(secure_proxy_url)
+            base_proxy = proxy_url.rstrip("/")
+            if "://" not in base_proxy:
+                base_proxy = f"https://{base_proxy}"
+            else:
+                base_proxy = base_proxy.replace("http://", "https://")
             
+            parsed_proxy = urlparse(base_proxy)
             parsed_original = urlparse(original_url)
             
             # Rewrite URL to HTTPS proxy (Ngrok forces HTTPS)
-            new_url = original_url.replace(f"https://{parsed_original.netloc}", secure_proxy_url)
+            new_url = original_url.replace(f"https://{parsed_original.netloc}", base_proxy)
             logger.info(f"Reverse Proxying Transport: {request.method} {new_url}")
             
             request.url = httpx.URL(new_url)
