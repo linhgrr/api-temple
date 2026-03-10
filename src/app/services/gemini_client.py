@@ -26,6 +26,11 @@ _ORIGINAL_ENDPOINTS = {
 _ORIGINAL_HEADERS = dict(Headers.GEMINI.value)
 _ORIGINAL_ROTATE_HEADERS = dict(Headers.ROTATE_COOKIES.value)
 
+# Reference to the library's send_request so we can monkeypatch it
+import gemini_webapi.utils.get_access_token as _gat
+from httpx import AsyncClient as _AsyncClient
+_original_send_request = _gat.send_request
+
 def _apply_ngrok_proxy(proxy_url: str):
     """Rewrite gemini_webapi endpoint constants to route through Ngrok reverse proxy.
 
@@ -65,12 +70,30 @@ def _apply_ngrok_proxy(proxy_url: str):
     rotate_headers["ngrok-skip-browser-warning"] = "1"
     Headers.ROTATE_COOKIES._value_ = rotate_headers
     
+    # Monkeypatch send_request: httpx's CookieJar won't send cookies to the
+    # ngrok domain (domain mismatch). Inject them as an explicit Cookie header.
+    async def _proxied_send_request(cookies: dict, proxy=None):
+        cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+        merged_headers = dict(Headers.GEMINI.value)
+        merged_headers["Cookie"] = cookie_header
+        async with _AsyncClient(
+            proxy=proxy,
+            headers=merged_headers,
+            follow_redirects=True,
+            verify=False,
+        ) as client:
+            response = await client.get(Endpoint.INIT.value)
+            response.raise_for_status()
+            return response, cookies
+
+    _gat.send_request = _proxied_send_request
+    
     logger.info(f"Ngrok reverse proxy activated: endpoints rewritten to {secure}")
     logger.info(f"  Endpoint.INIT  = {Endpoint.INIT}")
     logger.info(f"  Endpoint.GOOGLE = {Endpoint.GOOGLE} (direct, not proxied)")
 
 def _reset_endpoints():
-    """Restore original endpoint URLs and headers."""
+    """Restore original endpoint URLs, headers, and send_request."""
     type.__setattr__(Endpoint, "GOOGLE", _ORIGINAL_ENDPOINTS["GOOGLE"])
     type.__setattr__(Endpoint, "INIT", _ORIGINAL_ENDPOINTS["INIT"])
     type.__setattr__(Endpoint, "GENERATE", _ORIGINAL_ENDPOINTS["GENERATE"])
@@ -78,6 +101,7 @@ def _reset_endpoints():
     type.__setattr__(Endpoint, "ROTATE_COOKIES", _ORIGINAL_ENDPOINTS["ROTATE_COOKIES"])
     Headers.GEMINI._value_ = dict(_ORIGINAL_HEADERS)
     Headers.ROTATE_COOKIES._value_ = dict(_ORIGINAL_ROTATE_HEADERS)
+    _gat.send_request = _original_send_request
 
 # ----------------------------------------------------------------
 
