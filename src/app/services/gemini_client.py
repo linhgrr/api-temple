@@ -77,19 +77,28 @@ def _apply_ngrok_proxy(proxy_url: str):
     # Monkeypatch send_request: httpx's CookieJar won't send cookies to the
     # ngrok domain (domain mismatch). Inject them as an explicit Cookie header.
     async def _proxied_send_request(cookies, proxy=None):
-        cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
-        merged_headers = dict(Headers.GEMINI.value)
-        merged_headers["Cookie"] = cookie_header
-        async with _AsyncClient(
-            http2=True,
-            proxy=proxy,
-            headers=merged_headers,
-            follow_redirects=True,
-            verify=False,
-        ) as client:
-            response = await client.get(str(Endpoint.INIT))
-            response.raise_for_status()
-            return response, cookies
+        try:
+            url = str(Endpoint.INIT)
+            cookie_names = list(cookies.keys()) if hasattr(cookies, 'keys') else []
+            logger.info(f"[proxy-patch] send_request called, url={url}, cookie_keys={cookie_names}")
+            cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+            merged_headers = dict(Headers.GEMINI.value)
+            merged_headers["Cookie"] = cookie_header
+            logger.info(f"[proxy-patch] Cookie header length={len(cookie_header)}, has_1PSID={'__Secure-1PSID' in cookie_header}")
+            async with _AsyncClient(
+                http2=True,
+                proxy=proxy,
+                headers=merged_headers,
+                follow_redirects=True,
+                verify=False,
+            ) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                logger.info(f"[proxy-patch] response status={response.status_code}, body_len={len(response.text)}")
+                return response, cookies
+        except Exception as e:
+            logger.error(f"[proxy-patch] FAILED: {type(e).__name__}: {e}")
+            raise
 
     _gat.send_request = _proxied_send_request
     
