@@ -21,9 +21,16 @@ class MyGeminiClient:
     def __init__(self, secure_1psid: str, secure_1psidts: str, proxy: str | None = None) -> None:
         self.client = WebGeminiClient(secure_1psid, secure_1psidts, proxy)
 
-    async def init(self) -> None:
-        """Initialize the Gemini client."""
-        await self.client.init()
+    async def init(self, auto_refresh: bool = False) -> None:
+        """Initialize the Gemini client.
+
+        auto_refresh is disabled by default because when the server runs behind
+        a reverse-proxy tunnel (ngrok / cloudflare), the RotateCookies call
+        goes directly from the server IP — not through the tunnel — causing
+        Google to detect an IP mismatch and revoke the entire session.
+        Cookie freshness is handled by the browser extension instead.
+        """
+        await self.client.init(auto_refresh=auto_refresh)
 
     async def generate_content(self, message: str, model: str, files: Optional[List[Union[str, Path]]] = None):
         """

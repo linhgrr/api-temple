@@ -19,10 +19,11 @@ chrome.runtime.sendMessage({ action: "get-status" }, (s) => {
 });
 
 // Load settings
-chrome.storage.local.get(["apiUrl", "password", "syncIntervalMinutes"], (c) => {
+chrome.storage.local.get(["apiUrl", "password", "syncIntervalMinutes", "pullIntervalMinutes"], (c) => {
   $("#apiUrl").value = c.apiUrl || "";
   $("#password").value = c.password || "";
   $("#interval").value = c.syncIntervalMinutes || 10;
+  $("#pullInterval").value = c.pullIntervalMinutes || 5;
 });
 
 // Sync button
@@ -33,7 +34,6 @@ $("#syncBtn").addEventListener("click", () => {
     $("#syncBtn").disabled = false;
     $("#syncBtn").textContent = res.ok ? "✓ Synced!" : "✗ Failed";
     setTimeout(() => { $("#syncBtn").textContent = "⚡ Sync Now"; }, 2000);
-    // Refresh status
     chrome.runtime.sendMessage({ action: "get-status" }, (s) => {
       $("#status").innerHTML = `
         <div><span class="label">Cookies:</span> <span class="value">${s.hasCookies ? "✓ Found" : "✗ Not found"}</span></div>
@@ -47,18 +47,23 @@ $("#syncBtn").addEventListener("click", () => {
 
 // Save button
 $("#saveBtn").addEventListener("click", () => {
+  const syncMin = parseInt($("#interval").value) || 10;
+  const pullMin = parseInt($("#pullInterval").value) || 5;
+
   chrome.storage.local.set({
     apiUrl: $("#apiUrl").value.trim(),
     password: $("#password").value,
-    syncIntervalMinutes: parseInt($("#interval").value) || 10,
+    syncIntervalMinutes: syncMin,
+    pullIntervalMinutes: pullMin,
   }, () => {
     $("#saveBtn").textContent = "✓ Saved!";
     setTimeout(() => { $("#saveBtn").textContent = "💾 Save Settings"; }, 1500);
-    // Reset alarm with new interval
+
     chrome.alarms.clear("sync-cookies", () => {
-      chrome.alarms.create("sync-cookies", {
-        periodInMinutes: parseInt($("#interval").value) || 10,
-      });
+      chrome.alarms.create("sync-cookies", { periodInMinutes: syncMin });
+    });
+    chrome.alarms.clear("pull-cookies", () => {
+      chrome.alarms.create("pull-cookies", { periodInMinutes: pullMin });
     });
   });
 });

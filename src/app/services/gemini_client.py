@@ -20,6 +20,7 @@ _ORIGINAL_ENDPOINTS = {
     "INIT": str(Endpoint.INIT),
     "GENERATE": str(Endpoint.GENERATE),
     "BATCH_EXEC": str(Endpoint.BATCH_EXEC),
+    "ROTATE_COOKIES": str(Endpoint.ROTATE_COOKIES),
 }
 
 _ORIGINAL_HEADERS = dict(Headers.GEMINI.value)
@@ -37,6 +38,9 @@ def _apply_ngrok_proxy(proxy_url: str):
     type.__setattr__(Endpoint, "INIT", _ORIGINAL_ENDPOINTS["INIT"].replace("https://gemini.google.com", secure))
     type.__setattr__(Endpoint, "GENERATE", _ORIGINAL_ENDPOINTS["GENERATE"].replace("https://gemini.google.com", secure))
     type.__setattr__(Endpoint, "BATCH_EXEC", _ORIGINAL_ENDPOINTS["BATCH_EXEC"].replace("https://gemini.google.com", secure))
+    # RotateCookies (accounts.google.com) must also go through the tunnel;
+    # otherwise it leaks the server IP to Google and triggers session revocation.
+    type.__setattr__(Endpoint, "ROTATE_COOKIES", _ORIGINAL_ENDPOINTS["ROTATE_COOKIES"].replace("https://accounts.google.com", secure))
     
     # Patch default headers: update Host/Origin/Referer for the proxy and add ngrok header
     from urllib.parse import urlparse
@@ -58,6 +62,7 @@ def _reset_endpoints():
     type.__setattr__(Endpoint, "INIT", _ORIGINAL_ENDPOINTS["INIT"])
     type.__setattr__(Endpoint, "GENERATE", _ORIGINAL_ENDPOINTS["GENERATE"])
     type.__setattr__(Endpoint, "BATCH_EXEC", _ORIGINAL_ENDPOINTS["BATCH_EXEC"])
+    type.__setattr__(Endpoint, "ROTATE_COOKIES", _ORIGINAL_ENDPOINTS["ROTATE_COOKIES"])
     Headers.GEMINI._value_ = dict(_ORIGINAL_HEADERS)
 
 # ----------------------------------------------------------------

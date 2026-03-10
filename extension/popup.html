@@ -30,8 +30,10 @@
     <input type="text" id="apiUrl">
     <label>Password</label>
     <input type="password" id="password">
-    <label>Sync interval (minutes)</label>
+    <label>Push interval (minutes)</label>
     <input type="number" id="interval" min="1" max="1440">
+    <label>Pull interval (minutes)</label>
+    <input type="number" id="pullInterval" min="1" max="60">
   </div>
 
   <button class="btn btn-sync" id="syncBtn">⚡ Sync Now</button>
