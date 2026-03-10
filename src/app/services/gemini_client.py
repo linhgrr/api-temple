@@ -26,9 +26,13 @@ _ORIGINAL_ENDPOINTS = {
 _ORIGINAL_HEADERS = dict(Headers.GEMINI.value)
 _ORIGINAL_ROTATE_HEADERS = dict(Headers.ROTATE_COOKIES.value)
 
-# Reference to the library's send_request so we can monkeypatch it
-import gemini_webapi.utils.get_access_token as _gat
+# Reference to the library's send_request module so we can monkeypatch it.
+# Using sys.modules because `import gemini_webapi.utils.get_access_token`
+# resolves to the re-exported function, not the module.
+import sys as _sys
+import gemini_webapi.utils.get_access_token  # noqa: F401 — force module load
 from httpx import AsyncClient as _AsyncClient
+_gat = _sys.modules["gemini_webapi.utils.get_access_token"]
 _original_send_request = _gat.send_request
 
 def _apply_ngrok_proxy(proxy_url: str):
