@@ -24,46 +24,60 @@ _ORIGINAL_ENDPOINTS = {
 }
 
 _ORIGINAL_HEADERS = dict(Headers.GEMINI.value)
+_ORIGINAL_ROTATE_HEADERS = dict(Headers.ROTATE_COOKIES.value)
 
 def _apply_ngrok_proxy(proxy_url: str):
-    """Rewrite gemini_webapi endpoint constants to route through Ngrok reverse proxy."""
+    """Rewrite gemini_webapi endpoint constants to route through Ngrok reverse proxy.
+
+    Endpoint.GOOGLE (www.google.com) is intentionally NOT rewritten because:
+    1. The library's get_access_token sends a bare AsyncClient request to it
+       with NO custom headers (no ngrok-skip-browser-warning) and NO timeout
+       override — causing a 5-second httpx timeout through the tunnel.
+    2. That request doesn't carry session cookies, so calling it directly from
+       the server IP is safe — it only fetches auxiliary NID cookies.
+    """
     proxy_url = proxy_url.rstrip("/")
-    # Force HTTPS to avoid Ngrok 307 redirect
     secure = proxy_url.replace("http://", "https://")
     
-    # Use type.__setattr__ to bypass Enum's immutability protection.
-    # Patch ALL endpoints the library uses during auth + request flow,
-    # including GOOGLE (used in get_access_token to fetch initial cookies).
-    type.__setattr__(Endpoint, "GOOGLE", _ORIGINAL_ENDPOINTS["GOOGLE"].replace("https://www.google.com", secure))
+    from urllib.parse import urlparse
+    proxy_host = urlparse(secure).netloc
+    
+    # Rewrite endpoints that carry session cookies through the tunnel.
+    # GOOGLE is left untouched (see docstring above).
     type.__setattr__(Endpoint, "INIT", _ORIGINAL_ENDPOINTS["INIT"].replace("https://gemini.google.com", secure))
     type.__setattr__(Endpoint, "GENERATE", _ORIGINAL_ENDPOINTS["GENERATE"].replace("https://gemini.google.com", secure))
     type.__setattr__(Endpoint, "BATCH_EXEC", _ORIGINAL_ENDPOINTS["BATCH_EXEC"].replace("https://gemini.google.com", secure))
-    # RotateCookies (accounts.google.com) must also go through the tunnel;
-    # otherwise it leaks the server IP to Google and triggers session revocation.
     type.__setattr__(Endpoint, "ROTATE_COOKIES", _ORIGINAL_ENDPOINTS["ROTATE_COOKIES"].replace("https://accounts.google.com", secure))
     
-    # Patch default headers: update Host/Origin/Referer for the proxy and add ngrok header
-    from urllib.parse import urlparse
-    proxy_host = urlparse(secure).netloc
+    # Patch Headers.GEMINI — used by INIT / GENERATE / BATCH_EXEC.
+    # X-Forwarded-Host tells the home reverse proxy which Google domain to forward to.
     headers = dict(_ORIGINAL_HEADERS)
     headers["Host"] = proxy_host
     headers["Origin"] = secure
     headers["Referer"] = secure + "/"
+    headers["X-Forwarded-Host"] = "gemini.google.com"
     headers["ngrok-skip-browser-warning"] = "1"
     Headers.GEMINI._value_ = headers
     
+    # Patch Headers.ROTATE_COOKIES — used by RotateCookies (accounts.google.com).
+    rotate_headers = dict(_ORIGINAL_ROTATE_HEADERS)
+    rotate_headers["X-Forwarded-Host"] = "accounts.google.com"
+    rotate_headers["ngrok-skip-browser-warning"] = "1"
+    Headers.ROTATE_COOKIES._value_ = rotate_headers
+    
     logger.info(f"Ngrok reverse proxy activated: endpoints rewritten to {secure}")
     logger.info(f"  Endpoint.INIT  = {Endpoint.INIT}")
-    logger.info(f"  Endpoint.GOOGLE = {Endpoint.GOOGLE}")
+    logger.info(f"  Endpoint.GOOGLE = {Endpoint.GOOGLE} (direct, not proxied)")
 
 def _reset_endpoints():
-    """Restore original endpoint URLs."""
+    """Restore original endpoint URLs and headers."""
     type.__setattr__(Endpoint, "GOOGLE", _ORIGINAL_ENDPOINTS["GOOGLE"])
     type.__setattr__(Endpoint, "INIT", _ORIGINAL_ENDPOINTS["INIT"])
     type.__setattr__(Endpoint, "GENERATE", _ORIGINAL_ENDPOINTS["GENERATE"])
     type.__setattr__(Endpoint, "BATCH_EXEC", _ORIGINAL_ENDPOINTS["BATCH_EXEC"])
     type.__setattr__(Endpoint, "ROTATE_COOKIES", _ORIGINAL_ENDPOINTS["ROTATE_COOKIES"])
     Headers.GEMINI._value_ = dict(_ORIGINAL_HEADERS)
+    Headers.ROTATE_COOKIES._value_ = dict(_ORIGINAL_ROTATE_HEADERS)
 
 # ----------------------------------------------------------------
 
